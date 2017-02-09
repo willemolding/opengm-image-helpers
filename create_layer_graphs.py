@@ -34,7 +34,7 @@ def segment_overlap_graph(pixel_unaries, pixel_regularizer, segment_map, segment
 	n_labels_segments = segment_unaries.shape[-1]
 
 	# calculate the region adjacency graph for the segments
-	rag = graph.RAG(segment_map)
+	rag = graph.rag_mean_color(np.zeros_like(segment_map), segment_map)
 	rag_edges = np.array(rag.edges()) + n_pixels #segment indices start at n_pixels remember!
 
 	n_pixel_edges = (pixel_unaries.shape[0]-1)*pixel_unaries.shape[1] + (pixel_unaries.shape[1]-1)*pixel_unaries.shape[0]
@@ -76,15 +76,20 @@ def segment_overlap_graph(pixel_unaries, pixel_regularizer, segment_map, segment
 	return gm
 
 
+import time
+
 if __name__ == '__main__':
 	# run some tests on the package
+	shape = (100,100)
+	n_pixels = shape[0]*shape[1]
 
 	n_pixel_labels = 3
 	n_segment_labels = 4
-	pixels = np.random.random((5,5,n_pixel_labels))
-	segment_map = np.zeros((5,5))
-	segment_values = np.random.random((1,n_segment_labels))
+	pixels = np.random.random((shape+(n_pixel_labels,)))
+	segment_map = np.arange(n_pixels).reshape(shape)
+	segment_values = np.random.random((np.unique(segment_map).size,n_segment_labels))
 
+	t0 = time.time()
 	gm = segment_overlap_graph(
 		pixels, 
 		opengm.pottsFunction([n_pixel_labels,n_pixel_labels], 0.0, 0.5),
@@ -93,12 +98,19 @@ if __name__ == '__main__':
 		opengm.pottsFunction([n_segment_labels,n_segment_labels], 0.0, 0.5),
 		opengm.pottsFunction([n_pixel_labels, n_segment_labels], 0.0, 0.5),
 		)
+	t1 = time.time()
 
+	print "graph build in", t1-t0, "seconds"
 
-	assert gm.numberOfVariables == pixels.shape[0]*pixels.shape[1] + np.unique(segment_map).size
+	assert gm.numberOfVariables == n_pixels + np.unique(segment_map).size
 	assert gm.numberOfLabels(0) == n_pixel_labels
-	assert gm.numberOfLabels(pixels.shape[0]*pixels.shape[1]) == n_segment_labels
+	assert gm.numberOfLabels(n_pixels) == n_segment_labels
 
+	# test inference is possible 
 	inference = opengm.inference.BeliefPropagation(gm=gm)
+	t0 = time.time()
 	inference.infer()
+	t1 = time.time()
+
+	print "belief propagation completed in", t1-t0, "seconds"
 
