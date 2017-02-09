@@ -5,11 +5,7 @@ import numpy as np
 import opengm
 from skimage.future import graph
 
-import networkx 
-from networkx.drawing.nx_agraph import graphviz_layout
-networkx.graphviz_layout = graphviz_layout
-
-def segment_overlap_graph(pixel_unaries, pixel_regularizer, segment_map, segment_unaries, segment_regularizer, inter_layer_regularizer):
+def segment_overlap_graph(pixel_unaries, segment_map, segment_unaries, pixel_regularizer=None, segment_regularizer=None, inter_layer_regularizer=None):
 	"""
 	greates a graphical model comprised of two layers. 
 		- The first layer is a pixel lattice
@@ -58,29 +54,47 @@ def segment_overlap_graph(pixel_unaries, pixel_regularizer, segment_map, segment
 
 	## add pairwise functions
 	# pixel lattice
-	fid = gm.addFunction(pixel_regularizer)
-	vis = opengm.secondOrderGridVis(pixel_unaries.shape[0],pixel_unaries.shape[1])
-	gm.addFactors(fid,vis, finalize=False)
+	if pixel_regularizer is not None:
+		fid = gm.addFunction(pixel_regularizer)
+		vis = opengm.secondOrderGridVis(pixel_unaries.shape[0],pixel_unaries.shape[1])
+		gm.addFactors(fid,vis, finalize=False)
 
 	# segment rag
-	fid = gm.addFunction(segment_regularizer)
-	gm.addFactors(fid, rag_edges, finalize=False)
+	if segment_regularizer is not None:
+		fid = gm.addFunction(segment_regularizer)
+		gm.addFactors(fid, rag_edges, finalize=False)
 
 	# inter-layer
-	fid = gm.addFunction(inter_layer_regularizer)
-	vis = np.dstack([np.arange(n_pixels).reshape(pixel_unaries.shape[:2]), segment_map+n_pixels]).reshape((-1,2))
-	gm.addFactors(fid, vis, finalize=False)
+	if inter_layer_regularizer is not None:
+		fid = gm.addFunction(inter_layer_regularizer)
+		vis = np.dstack([np.arange(n_pixels).reshape(pixel_unaries.shape[:2]), segment_map+n_pixels]).reshape((-1,2))
+		gm.addFactors(fid, vis, finalize=False)
 
 	gm.finalize()
 
 	return gm
 
 
-import time
+def create_ahn():
+	"""
+	The ascociative hierachical network
+
+	These graphical models have identical solutions to models with high order factors but in fact pairwise models
+	"""
+	pass
+
+
+
 
 if __name__ == '__main__':
+	import time
+
+	import networkx 
+	from networkx.drawing.nx_agraph import graphviz_layout
+	networkx.graphviz_layout = graphviz_layout
+
 	# run some tests on the package
-	shape = (100,100)
+	shape = (200,200)
 	n_pixels = shape[0]*shape[1]
 
 	n_pixel_labels = 3
@@ -92,9 +106,9 @@ if __name__ == '__main__':
 	t0 = time.time()
 	gm = segment_overlap_graph(
 		pixels, 
-		opengm.pottsFunction([n_pixel_labels,n_pixel_labels], 0.0, 0.5),
 		segment_map,
 		segment_values,
+		opengm.pottsFunction([n_pixel_labels,n_pixel_labels], 0.0, 0.5),
 		opengm.pottsFunction([n_segment_labels,n_segment_labels], 0.0, 0.5),
 		opengm.pottsFunction([n_pixel_labels, n_segment_labels], 0.0, 0.5),
 		)
@@ -106,11 +120,13 @@ if __name__ == '__main__':
 	assert gm.numberOfLabels(0) == n_pixel_labels
 	assert gm.numberOfLabels(n_pixels) == n_segment_labels
 
-	# test inference is possible 
-	inference = opengm.inference.BeliefPropagation(gm=gm)
-	t0 = time.time()
-	inference.infer()
-	t1 = time.time()
+	# opengm.visualizeGm(gm)
 
-	print "belief propagation completed in", t1-t0, "seconds"
+	# # test inference is possible 
+	# inference = opengm.inference.BeliefPropagation(gm=gm)
+	# t0 = time.time()
+	# inference.infer()
+	# t1 = time.time()
+
+	# print "belief propagation completed in", t1-t0, "seconds"
 
