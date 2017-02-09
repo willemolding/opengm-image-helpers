@@ -1,8 +1,13 @@
 """
 functions to create instances of opengm graphical models for various useful layer graphs
 """
+import numpy as np
 import opengm
+from skimage.future import graph
 
+import networkx 
+from networkx.drawing.nx_agraph import graphviz_layout
+networkx.graphviz_layout = graphviz_layout
 
 def segment_overlap_graph(pixel_unaries, pixel_regularizer, segment_map, segment_unaries, segment_regularizer, inter_layer_regularizer):
 	"""
@@ -23,12 +28,77 @@ def segment_overlap_graph(pixel_unaries, pixel_regularizer, segment_map, segment
 	# calculate how many variables and factors will be required
 	n_pixels = pixel_unaries.shape[0]*pixel_unaries.shape[1]
 	n_segments = segment_unaries.shape[0]
+	n_variables = n_pixels + n_segments
 
-	n_labels_pixels = pixel_unaries.shape[2]
-	n_labels_segments = segment_unaries.shape[1]
+	n_labels_pixels = pixel_unaries.shape[-1]
+	n_labels_segments = segment_unaries.shape[-1]
+
+	# calculate the region adjacency graph for the segments
+	rag = graph.RAG(segment_map)
+	rag_edges = np.array(rag.edges()) + n_pixels #segment indices start at n_pixels remember!
+
+	n_pixel_edges = (pixel_unaries.shape[0]-1)*pixel_unaries.shape[1] + (pixel_unaries.shape[1]-1)*pixel_unaries.shape[0]
+	n_segment_edges = rag_edges.shape[0] #check this is right
+	n_inter_edges = n_pixels
+	n_edges = n_pixel_edges + n_segment_edges + n_inter_edges
+
 
 	# allocate space for the model and all its variables
 	gm = opengm.graphicalModel([n_labels_pixels]*n_pixels + [n_labels_segments]*n_segments)
 
-	gm.reserveFunctions(,'explicit')
-	gm.reserveFactors()
+	gm.reserveFunctions(n_variables + 3,'explicit') # the unary functions plus the 3 types of regularizer
+	gm.reserveFactors(n_variables + n_edges)
+
+	# add unary functions and factors
+	fids = gm.addFunctions(pixel_unaries.reshape([n_pixels,n_labels_pixels]))
+	gm.addFactors(fids, np.arange(n_pixels), finalize=False)
+
+	fids = gm.addFunctions(segment_unaries)
+	gm.addFactors(fids, n_pixels + np.arange(n_segments), finalize=False)
+
+	## add pairwise functions
+	# pixel lattice
+	fid = gm.addFunction(pixel_regularizer)
+	vis = opengm.secondOrderGridVis(pixel_unaries.shape[0],pixel_unaries.shape[1])
+	gm.addFactors(fid,vis, finalize=False)
+
+	# segment rag
+	fid = gm.addFunction(segment_regularizer)
+	gm.addFactors(fid, rag_edges, finalize=False)
+
+	# inter-layer
+	fid = gm.addFunction(inter_layer_regularizer)
+	vis = np.dstack([np.arange(n_pixels).reshape(pixel_unaries.shape[:2]), segment_map+n_pixels]).reshape((-1,2))
+	gm.addFactors(fid, vis, finalize=False)
+
+	gm.finalize()
+
+	return gm
+
+
+if __name__ == '__main__':
+	# run some tests on the package
+
+	n_pixel_labels = 3
+	n_segment_labels = 4
+	pixels = np.random.random((5,5,n_pixel_labels))
+	segment_map = np.zeros((5,5))
+	segment_values = np.random.random((1,n_segment_labels))
+
+	gm = segment_overlap_graph(
+		pixels, 
+		opengm.pottsFunction([n_pixel_labels,n_pixel_labels], 0.0, 0.5),
+		segment_map,
+		segment_values,
+		opengm.pottsFunction([n_segment_labels,n_segment_labels], 0.0, 0.5),
+		opengm.pottsFunction([n_pixel_labels, n_segment_labels], 0.0, 0.5),
+		)
+
+
+	assert gm.numberOfVariables == pixels.shape[0]*pixels.shape[1] + np.unique(segment_map).size
+	assert gm.numberOfLabels(0) == n_pixel_labels
+	assert gm.numberOfLabels(pixels.shape[0]*pixels.shape[1]) == n_segment_labels
+
+	inference = opengm.inference.BeliefPropagation(gm=gm)
+	inference.infer()
+
