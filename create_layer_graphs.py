@@ -5,6 +5,9 @@ import numpy as np
 import opengm
 from skimage.future import graph
 
+def _remove_rows_with_negative(arr):
+	return arr[np.greater_equal(arr, 0).all(axis=1)]
+
 def segment_overlap_graph(pixel_unaries, segment_map, segment_unaries, pixel_regularizer=None, segment_regularizer=None, inter_layer_regularizer=None):
 	"""
 	greates a graphical model comprised of two layers. 
@@ -14,12 +17,18 @@ def segment_overlap_graph(pixel_unaries, segment_map, segment_unaries, pixel_reg
 
 	Parameters:
 		- pixel_unaries - a 3D array of shape (width, height, n_labels). 
-		- pixel_regularizer - a pairwise opengm function e.g. opengm.PottsFunction([2,2],0.0,beta)
-		- segment_map - a 2d array of shape (width, height). Each element >= 0 is a segment id that maps the corresponding pixel to that id. -1 represents no segment.
+		- segment_map - a 2d array of shape (width, height). Each element >= 0 is a segment id that maps the corresponding pixel to that id. -1 represents no segment and no corresponding node will be added
 		- segment_unaries - a 2d arry of shape (n_segments, n_labels)
-		- segment_regularizer - a pairwise opengm function, same properties as pixel_regularizer
-		- inter_layer_regularizer - a pairwise opengm function, same properties as pixel_regularizer
+		- pixel_regularizer (optional) - a pairwise opengm function e.g. opengm.PottsFunction([2,2],0.0,beta) or list of opengm functions of length n_pixels
+		- segment_regularizer (optional) - a pairwise opengm function, same requirements as pixel_regularizer
+		- inter_layer_regularizer (optional) - a pairwise opengm function, same requirements as pixel_regularizer
 	"""
+
+	if not np.array_equal( np.unique(segment_map[segment_map >= 0]) , np.arange(np.max(segment_map+1)) ):
+		raise ValueError('Segment map is not valid. Segment identifiers must have all values from 0 to max(segment_map)')
+
+	if not segment_unaries.shape[0] == np.max(segment_map)+1:
+		raise ValueError('segment map and segment unaries are not compatible')
 
 	# calculate how many variables and factors will be required
 	n_pixels = pixel_unaries.shape[0]*pixel_unaries.shape[1]
@@ -31,7 +40,9 @@ def segment_overlap_graph(pixel_unaries, segment_map, segment_unaries, pixel_reg
 
 	# calculate the region adjacency graph for the segments
 	rag = graph.rag_mean_color(np.zeros_like(segment_map), segment_map)
-	rag_edges = np.array(rag.edges()) + n_pixels #segment indices start at n_pixels remember!
+	rag_edges = np.array(rag.edges()) 
+	rag_edges = _remove_rows_with_negative(rag_edges) #remove all edges connection to segment labels < 0 as they represent no segment
+	rag_edges += n_pixels #segment indices start at n_pixels remember!
 
 	n_pixel_edges = (pixel_unaries.shape[0]-1)*pixel_unaries.shape[1] + (pixel_unaries.shape[1]-1)*pixel_unaries.shape[0]
 	n_segment_edges = rag_edges.shape[0] #check this is right
@@ -62,12 +73,14 @@ def segment_overlap_graph(pixel_unaries, segment_map, segment_unaries, pixel_reg
 	# segment rag
 	if segment_regularizer is not None:
 		fid = gm.addFunction(segment_regularizer)
-		gm.addFactors(fid, rag_edges, finalize=False)
+		gm.addFactors(fid, np.sort(rag_edges, axis=1), finalize=False)
 
 	# inter-layer
 	if inter_layer_regularizer is not None:
 		fid = gm.addFunction(inter_layer_regularizer)
-		vis = np.dstack([np.arange(n_pixels).reshape(pixel_unaries.shape[:2]), segment_map+n_pixels]).reshape((-1,2))
+		vis = np.dstack([np.arange(n_pixels).reshape(pixel_unaries.shape[:2]), segment_map]).reshape((-1,2))
+		vis = _remove_rows_with_negative(vis)
+		vis[:,1] += n_pixels
 		gm.addFactors(fid, vis, finalize=False)
 
 	gm.finalize()
@@ -77,7 +90,7 @@ def segment_overlap_graph(pixel_unaries, segment_map, segment_unaries, pixel_reg
 
 def create_ahn():
 	"""
-	The ascociative hierachical network
+	A 2 layer ascociative hierachical network
 
 	These graphical models have identical solutions to models with high order factors but in fact pairwise models
 	"""
@@ -94,14 +107,19 @@ if __name__ == '__main__':
 	networkx.graphviz_layout = graphviz_layout
 
 	# run some tests on the package
-	shape = (200,200)
+	shape = (3,3)
 	n_pixels = shape[0]*shape[1]
 
 	n_pixel_labels = 3
 	n_segment_labels = 4
 	pixels = np.random.random((shape+(n_pixel_labels,)))
-	segment_map = np.arange(n_pixels).reshape(shape)
-	segment_values = np.random.random((np.unique(segment_map).size,n_segment_labels))
+
+	segment_map = np.zeros(shape)
+	segment_map[0,0] = 1
+	segment_map[0,1] = 2
+	segment_map[-1,-1] = -1
+	print segment_map
+	segment_values = np.random.random((np.max(segment_map)+1,n_segment_labels))
 
 	t0 = time.time()
 	gm = segment_overlap_graph(
@@ -116,11 +134,11 @@ if __name__ == '__main__':
 
 	print "graph build in", t1-t0, "seconds"
 
-	assert gm.numberOfVariables == n_pixels + np.unique(segment_map).size
+	assert gm.numberOfVariables == n_pixels + np.max(segment_map)+1
 	assert gm.numberOfLabels(0) == n_pixel_labels
 	assert gm.numberOfLabels(n_pixels) == n_segment_labels
 
-	# opengm.visualizeGm(gm)
+	opengm.visualizeGm(gm)
 
 	# # test inference is possible 
 	# inference = opengm.inference.BeliefPropagation(gm=gm)
