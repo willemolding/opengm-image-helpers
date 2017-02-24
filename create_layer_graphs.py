@@ -10,8 +10,22 @@ from skimage.future import graph
 def _remove_rows_with_negative(arr):
 	return arr[np.greater_equal(arr, 0).all(axis=1)]
 
+def _check_valid_segment_map(segment_map):
+	if not np.array_equal( np.unique(segment_map[segment_map >= 0]) , np.arange(np.max(segment_map+1)) ):
+		raise ValueError('Segment map is not valid. Segment identifiers must have all values from 0 to max(segment_map)')
+
+def _check_compatible_segment_map_unaries(segment_map, unaries):
+	if not unaries.shape[0] == np.max(segment_map)+1:
+		raise ValueError('segment map and segment unaries are not compatible')
+
 def calc_n_pixel_edges(image_shape):
 	return (image_shape[0]-1)*image_shape[1] + (image_shape[1]-1)*image_shape[0]
+
+def segment_map_to_rag_edges(segment_map):
+	rag = graph.rag_mean_color(np.zeros_like(segment_map), segment_map)
+	rag_edges = np.array(rag.edges()) 
+	rag_edges = _remove_rows_with_negative(rag_edges) #remove all edges connection to segment labels < 0 as they represent no segment
+	return rag_edges
 
 
 ##########################################################################################
@@ -65,9 +79,12 @@ def add_lattice_layer(gm, pixel_unaries, pixel_regularizer=None, offset=0):
 		- pixel_unaries - a 3D array of shape (width, height, n_labels). 
 		- pixel_regularizer (optional) - a pairwise opengm function e.g. opengm.PottsFunction([2,2],0.0,beta)
 	"""
+	n_labels = pixel_unaries.shape[-1]
+	n_pixels = pixel_unaries.shape[0]*pixel_unaries.shape[1]
 
-	edges = opengm.secondOrderGridVis(pixel_unaries.shape[0],pixel_unaries.shape[1])
-	unaries = pixel_unaries.reshape([n_pixels,n_labels_pixels])
+	edges = np.array(opengm.secondOrderGridVis(pixel_unaries.shape[0],pixel_unaries.shape[1]))
+
+	unaries = pixel_unaries.reshape([n_pixels,n_labels])
 
 	gm = add_layer(gm, unaries, edges, pairwise=pixel_regularizer, offset=offset)
 
@@ -83,7 +100,7 @@ def add_potts_lattice_layer(gm, pixel_unaries, beta, offset=0):
 	"""
 	n_labels = pixel_unaries.shape[-1]
 	add_lattice_layer(gm, pixel_unaries, 
-		pixel_regularizer=opengm.PottsFunction([n_labels,n_labels],0.0,beta), offset)
+		pixel_regularizer=opengm.PottsFunction([n_labels,n_labels],0.0,beta), offset=offset)
 
 
 
@@ -105,6 +122,28 @@ def pixel_lattice_graph(pixel_unaries, pixel_regularizer):
 	gm.finalize()
 	return gm
 
+def segment_adjacency_graph(segment_unaries, segment_map, segment_regularizer=None):
+	"""
+	Creates a region adjacency graph. Each segment has a variable and adjacent segments are linked by edges
+	"""
+	_check_valid_segment_map(segment_map)
+	_check_compatible_segment_map_unaries(segment_map, segment_unaries)
+
+	n_vars = segment_unaries.shape[0]
+	n_labels = segment_unaries.shape[-1]
+	edges = segment_map_to_rag_edges(segment_map)
+	n_edges = edges.shape[0]
+
+	# allocate space for the model and all its variables
+	gm = opengm.graphicalModel([n_labels]*n_vars)
+
+	gm.reserveFunctions(n_vars + n_edges,'explicit') # the unary functions plus the 3 types of regularizer
+	gm.reserveFactors(n_vars + n_edges)
+
+	gm = add_layer(gm, segment_unaries, edges, segment_regularizer)
+	gm.finalize()
+	return gm
+
 
 def segment_overlap_graph(pixel_unaries, segment_map, segment_unaries, pixel_regularizer=None, segment_regularizer=None, inter_layer_regularizer=None):
 	"""
@@ -121,12 +160,8 @@ def segment_overlap_graph(pixel_unaries, segment_map, segment_unaries, pixel_reg
 		- segment_regularizer (optional) - a pairwise opengm function, same requirements as pixel_regularizer
 		- inter_layer_regularizer (optional) - a pairwise opengm function, same requirements as pixel_regularizer
 	"""
-
-	if not np.array_equal( np.unique(segment_map[segment_map >= 0]) , np.arange(np.max(segment_map+1)) ):
-		raise ValueError('Segment map is not valid. Segment identifiers must have all values from 0 to max(segment_map)')
-
-	if not segment_unaries.shape[0] == np.max(segment_map)+1:
-		raise ValueError('segment map and segment unaries are not compatible')
+	_check_valid_segment_map(segment_map)
+	_check_compatible_segment_map_unaries(segment_map, unaries)
 
 	# calculate how many variables and factors will be required
 	n_pixels = pixel_unaries.shape[0]*pixel_unaries.shape[1]
@@ -137,9 +172,7 @@ def segment_overlap_graph(pixel_unaries, segment_map, segment_unaries, pixel_reg
 	n_labels_segments = segment_unaries.shape[-1]
 
 	# calculate the region adjacency graph for the segments
-	rag = graph.rag_mean_color(np.zeros_like(segment_map), segment_map)
-	rag_edges = np.array(rag.edges()) 
-	rag_edges = _remove_rows_with_negative(rag_edges) #remove all edges connection to segment labels < 0 as they represent no segment
+	rag_edges = segment_map_to_rag_edges(segment_map)
 	rag_edges += n_pixels #segment indices start at n_pixels remember!
 
 	n_pixel_edges = (pixel_unaries.shape[0]-1)*pixel_unaries.shape[1] + (pixel_unaries.shape[1]-1)*pixel_unaries.shape[0]
@@ -186,33 +219,10 @@ def segment_overlap_graph(pixel_unaries, segment_map, segment_unaries, pixel_reg
 	return gm
 
 
-def create_ahn(pixel_unaries, segment_map, beta, gamma_l, k, gamma_max, make_metric=True):
-	"""
-	A 2 layer ascociative hierachical network
 
-	These graphical models have identical solutions to models with high order factors but can be reduced to pairwise models
-
-	By default the functions are reparameterized to be a metric so alpha-expansion can be used 
-	"""
-	n_labels_pixels = pixel_unaries.shape[-1]
-	n_labels_segments = n_labels_pixels + 1 #plus the free label
-
-	pixel_regularizer = opengm.PottsFunction([n_labels_pixels, n_labels_pixels], 0.0, beta)
-	segment_unaries = np.array([gamma_l]*n_labels_pixels + [gamma_max])
-
-
-	if make_metric:
-		pass
-
-	else:
-		inter_layer_regularizer = np.append((np.ones((n_pixel_labels, n_pixel_labels)) - np.diag(np.ones(n_pixel_labels))) * k , np.zeros((n_pixel_labels,1)), axis=1 )
-
-	return segment_overlap_graph(pixel_unaries, segment_map, segment_unaries, 
-		pixel_regularizer=pixel_regularizer, 
-		segment_regularizer=None, 
-		inter_layer_regularizer=inter_layer_regularizer)
-
-	
+##########################################################################################
+## Tests
+##########################################################################################
 
 
 if __name__ == '__main__':
@@ -223,7 +233,7 @@ if __name__ == '__main__':
 	networkx.graphviz_layout = graphviz_layout
 
 	# run some tests on the package
-	shape = (1000,1000)
+	shape = (4,4)
 	n_pixels = shape[0]*shape[1]
 
 	n_pixel_labels = 2
@@ -232,6 +242,22 @@ if __name__ == '__main__':
 
 	segment_map = np.arange(n_pixels).reshape(shape)
 	segment_values = np.random.random((np.max(segment_map)+1,n_segment_labels))
+
+
+	t0 = time.time()
+	gm = pixel_lattice_graph(pixels, opengm.pottsFunction([n_pixel_labels,n_pixel_labels], 0.0, 0.5))
+	t1 = time.time()
+
+	opengm.visualizeGm(gm)
+	print "graph build in", t1-t0, "seconds"
+
+
+	t0 = time.time()
+	gm  = segment_adjacency_graph(segment_values, segment_map, segment_regularizer=opengm.pottsFunction([n_segment_labels,n_segment_labels], 0.0, 0.5))	
+	t1 = time.time()
+	opengm.visualizeGm(gm)
+	print "graph build in", t1-t0, "seconds"
+
 
 	t0 = time.time()
 	gm = segment_overlap_graph(
@@ -246,11 +272,12 @@ if __name__ == '__main__':
 
 	print "graph build in", t1-t0, "seconds"
 
-	assert gm.numberOfVariables == n_pixels + np.max(segment_map)+1
-	assert gm.numberOfLabels(0) == n_pixel_labels
-	assert gm.numberOfLabels(n_pixels) == n_segment_labels
 
-	# opengm.visualizeGm(gm)
+	# assert gm.numberOfVariables == n_pixels + np.max(segment_map)+1
+	# assert gm.numberOfLabels(0) == n_pixel_labels
+	# assert gm.numberOfLabels(n_pixels) == n_segment_labels
+
+	opengm.visualizeGm(gm)
 
 	# test inference is possible 
 	inference = opengm.inference.GraphCut(gm=gm)
