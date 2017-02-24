@@ -1,5 +1,7 @@
 """
 functions to create instances of opengm graphical models for various useful layer graphs
+
+
 """
 import numpy as np
 import opengm
@@ -7,6 +9,102 @@ from skimage.future import graph
 
 def _remove_rows_with_negative(arr):
 	return arr[np.greater_equal(arr, 0).all(axis=1)]
+
+def calc_n_pixel_edges(image_shape):
+	return (image_shape[0]-1)*image_shape[1] + (image_shape[1]-1)*image_shape[0]
+
+
+##########################################################################################
+## Functions for adding layers to existing graphs
+##########################################################################################
+
+
+def add_layer(gm, unaries=None, edges=None, pairwise=None, offset=0):
+	"""
+	adds a layer to a GM. All variables in a layer must share the same label space
+
+	The layer may have unary and/or pairwise functions
+
+	unaries are given as shape (n_vars, n_labels)
+	edges are given as shape (n_edges, 2)
+	pairwise are given as either: 
+		pairwise opengm function e.g. opengm.PottsFunction([n_labels,n_labels],0.0,beta)
+		nd.array of shape (n_labels, n_labels)
+		list of pairwise opengm functions of length n_edges
+		list of nd.array of length n_edges where each array has shape (n_labels, n_labels)
+
+	"""
+
+	n_vars = unaries.shape[0]
+
+	if unaries is not None:
+		# add unary functions and factors
+		fids = gm.addFunctions(unaries)
+		vids = np.arange(n_vars) + offset
+		gm.addFactors(fids, vids, finalize=False)
+
+
+	if pairwise is not None and edges is not None:
+		if isinstance(pairwise, list):
+			fids = gm.addFunctions(pairwise)
+		else:
+			# add pairwise functions and factors
+			fids = gm.addFunction(pairwise)
+		vids = edges + offset
+		gm.addFactors(fids, vids, finalize=False)
+
+	return gm
+
+def add_lattice_layer(gm, pixel_unaries, pixel_regularizer=None, offset=0):
+	"""
+	Adds a lattice (pixel grid) layer to a GM where all edges share the same regularizer
+
+	offset is the variable index of the first new variable. Make this the count of all variables already added
+
+	Parameters:
+		- pixel_unaries - a 3D array of shape (width, height, n_labels). 
+		- pixel_regularizer (optional) - a pairwise opengm function e.g. opengm.PottsFunction([2,2],0.0,beta)
+	"""
+
+	edges = opengm.secondOrderGridVis(pixel_unaries.shape[0],pixel_unaries.shape[1])
+	unaries = pixel_unaries.reshape([n_pixels,n_labels_pixels])
+
+	gm = add_layer(gm, unaries, edges, pairwise=pixel_regularizer, offset=offset)
+
+	return gm
+
+def add_potts_lattice_layer(gm, pixel_unaries, beta, offset=0):
+	"""
+	Adds a lattice layer to a gm where all pairwise functions are Potts model
+
+	Parameters:
+		- pixel_unaries - a 3D array of shape (width, height, n_labels). 
+		- beta - the smoothing parameter for the Potts model. Penalty for label dissimilarity
+	"""
+	n_labels = pixel_unaries.shape[-1]
+	add_lattice_layer(gm, pixel_unaries, 
+		pixel_regularizer=opengm.PottsFunction([n_labels,n_labels],0.0,beta), offset)
+
+
+
+##########################################################################################
+## Functions for constructing graphs
+##########################################################################################
+
+def pixel_lattice_graph(pixel_unaries, pixel_regularizer):
+	n_vars = pixel_unaries.shape[0]*pixel_unaries.shape[1]
+	n_labels = pixel_unaries.shape[-1]
+	n_edges = calc_n_pixel_edges(pixel_unaries.shape)
+
+	gm = opengm.graphicalModel([n_labels]*n_vars)
+	gm.reserveFunctions(n_vars + 1,'explicit') # the unary functions plus the 1 type of regularizer
+	gm.reserveFactors(n_vars + n_edges)
+
+	gm = add_lattice_layer(gm, pixel_unaries, pixel_regularizer)
+
+	gm.finalize()
+	return gm
+
 
 def segment_overlap_graph(pixel_unaries, segment_map, segment_unaries, pixel_regularizer=None, segment_regularizer=None, inter_layer_regularizer=None):
 	"""
@@ -88,15 +186,33 @@ def segment_overlap_graph(pixel_unaries, segment_map, segment_unaries, pixel_reg
 	return gm
 
 
-def create_ahn():
+def create_ahn(pixel_unaries, segment_map, beta, gamma_l, k, gamma_max, make_metric=True):
 	"""
 	A 2 layer ascociative hierachical network
 
-	These graphical models have identical solutions to models with high order factors but in fact pairwise models
+	These graphical models have identical solutions to models with high order factors but can be reduced to pairwise models
+
+	By default the functions are reparameterized to be a metric so alpha-expansion can be used 
 	"""
-	pass
+	n_labels_pixels = pixel_unaries.shape[-1]
+	n_labels_segments = n_labels_pixels + 1 #plus the free label
+
+	pixel_regularizer = opengm.PottsFunction([n_labels_pixels, n_labels_pixels], 0.0, beta)
+	segment_unaries = np.array([gamma_l]*n_labels_pixels + [gamma_max])
 
 
+	if make_metric:
+		pass
+
+	else:
+		inter_layer_regularizer = np.append((np.ones((n_pixel_labels, n_pixel_labels)) - np.diag(np.ones(n_pixel_labels))) * k , np.zeros((n_pixel_labels,1)), axis=1 )
+
+	return segment_overlap_graph(pixel_unaries, segment_map, segment_unaries, 
+		pixel_regularizer=pixel_regularizer, 
+		segment_regularizer=None, 
+		inter_layer_regularizer=inter_layer_regularizer)
+
+	
 
 
 if __name__ == '__main__':
@@ -107,18 +223,14 @@ if __name__ == '__main__':
 	networkx.graphviz_layout = graphviz_layout
 
 	# run some tests on the package
-	shape = (3,3)
+	shape = (1000,1000)
 	n_pixels = shape[0]*shape[1]
 
-	n_pixel_labels = 3
-	n_segment_labels = 4
+	n_pixel_labels = 2
+	n_segment_labels = 2
 	pixels = np.random.random((shape+(n_pixel_labels,)))
 
-	segment_map = np.zeros(shape)
-	segment_map[0,0] = 1
-	segment_map[0,1] = 2
-	segment_map[-1,-1] = -1
-	print segment_map
+	segment_map = np.arange(n_pixels).reshape(shape)
 	segment_values = np.random.random((np.max(segment_map)+1,n_segment_labels))
 
 	t0 = time.time()
@@ -138,13 +250,17 @@ if __name__ == '__main__':
 	assert gm.numberOfLabels(0) == n_pixel_labels
 	assert gm.numberOfLabels(n_pixels) == n_segment_labels
 
-	opengm.visualizeGm(gm)
+	# opengm.visualizeGm(gm)
 
-	# # test inference is possible 
-	# inference = opengm.inference.BeliefPropagation(gm=gm)
-	# t0 = time.time()
-	# inference.infer()
-	# t1 = time.time()
+	# test inference is possible 
+	inference = opengm.inference.GraphCut(gm=gm)
+	t0 = time.time()
+	inference.infer()
+	t1 = time.time()
 
-	# print "belief propagation completed in", t1-t0, "seconds"
+	print "inference completed in", t1-t0, "seconds"
+
+# For a binary model of size (1000,1000) with only single pixel segments (e.g. 2 million nodes)
+# graph build in 66.5958359241 seconds
+# inference completed in 131.123669863 seconds
 
