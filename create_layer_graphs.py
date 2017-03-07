@@ -6,6 +6,8 @@ functions to create instances of opengm graphical models for various useful laye
 import numpy as np
 import opengm
 from skimage.future import graph
+import vigra
+from vigra import graphs
 
 def _remove_rows_with_negative(arr):
 	return arr[np.greater_equal(arr, 0).all(axis=1)]
@@ -16,16 +18,19 @@ def _check_valid_segment_map(segment_map):
 
 def _check_compatible_segment_map_unaries(segment_map, unaries):
 	if not unaries.shape[0] == np.max(segment_map)+1:
-		raise ValueError('segment map and segment unaries are not compatible')
+		raise ValueError('segment map and segment unaries are not compatible. Segment map has {} values. unaries has shape{}'.format(
+			segment_map.shape, np.max(segment_map)+1, unaries.shape))
 
 def calc_n_pixel_edges(image_shape):
 	return (image_shape[0]-1)*image_shape[1] + (image_shape[1]-1)*image_shape[0]
 
 def segment_map_to_rag_edges(segment_map):
-	rag = graph.rag_mean_color(np.zeros_like(segment_map), segment_map)
+	# rag = graph.rag_mean_color(np.zeros_like(segment_map), segment_map)
+	rag = graph.RAG(segment_map, connectivity=2)
 	rag_edges = np.array(rag.edges()) 
 	rag_edges = _remove_rows_with_negative(rag_edges) #remove all edges connection to segment labels < 0 as they represent no segment
 	return rag_edges
+
 
 
 ##########################################################################################
@@ -64,7 +69,10 @@ def add_layer(gm, unaries=None, edges=None, pairwise=None, offset=0):
 		else:
 			# add pairwise functions and factors
 			fids = gm.addFunction(pairwise)
-		vids = edges + offset
+		if offset == 0:
+			vids = edges
+		else:
+			vids = np.array(edges) + offset
 		gm.addFactors(fids, vids, finalize=False)
 
 	return gm
@@ -82,9 +90,9 @@ def add_lattice_layer(gm, pixel_unaries, pixel_regularizer=None, offset=0):
 	n_labels = pixel_unaries.shape[-1]
 	n_pixels = pixel_unaries.shape[0]*pixel_unaries.shape[1]
 
-	edges = np.array(opengm.secondOrderGridVis(pixel_unaries.shape[0],pixel_unaries.shape[1]))
+	edges = opengm.secondOrderGridVis(pixel_unaries.shape[0],pixel_unaries.shape[1])
 
-	unaries = pixel_unaries.reshape([n_pixels,n_labels])
+	unaries = pixel_unaries.reshape((n_pixels,n_labels))
 
 	gm = add_layer(gm, unaries, edges, pairwise=pixel_regularizer, offset=offset)
 
@@ -101,6 +109,8 @@ def add_potts_lattice_layer(gm, pixel_unaries, beta, offset=0):
 	n_labels = pixel_unaries.shape[-1]
 	add_lattice_layer(gm, pixel_unaries, 
 		pixel_regularizer=opengm.PottsFunction([n_labels,n_labels],0.0,beta), offset=offset)
+
+	return gm
 
 
 
@@ -122,6 +132,20 @@ def pixel_lattice_graph(pixel_unaries, pixel_regularizer):
 	gm.finalize()
 	return gm
 
+def potts_lattice_graph(pixel_unaries, beta):
+	n_vars = pixel_unaries.shape[0]*pixel_unaries.shape[1]
+	n_labels = pixel_unaries.shape[-1]
+	n_edges = calc_n_pixel_edges(pixel_unaries.shape)
+
+	gm = opengm.graphicalModel([n_labels]*n_vars)
+	gm.reserveFunctions(n_vars + 1,'explicit') # the unary functions plus the 1 type of regularizer
+	gm.reserveFactors(n_vars + n_edges)
+
+	gm = add_potts_lattice_layer(gm, pixel_unaries, beta)
+
+	gm.finalize()
+	return gm
+
 def segment_adjacency_graph(segment_unaries, segment_map, segment_regularizer=None):
 	"""
 	Creates a region adjacency graph. Each segment has a variable and adjacent segments are linked by edges
@@ -131,7 +155,9 @@ def segment_adjacency_graph(segment_unaries, segment_map, segment_regularizer=No
 
 	n_vars = segment_unaries.shape[0]
 	n_labels = segment_unaries.shape[-1]
+
 	edges = segment_map_to_rag_edges(segment_map)
+
 	n_edges = edges.shape[0]
 
 	# allocate space for the model and all its variables
@@ -161,7 +187,7 @@ def segment_overlap_graph(pixel_unaries, segment_map, segment_unaries, pixel_reg
 		- inter_layer_regularizer (optional) - a pairwise opengm function, same requirements as pixel_regularizer
 	"""
 	_check_valid_segment_map(segment_map)
-	_check_compatible_segment_map_unaries(segment_map, unaries)
+	_check_compatible_segment_map_unaries(segment_map, segment_unaries)
 
 	# calculate how many variables and factors will be required
 	n_pixels = pixel_unaries.shape[0]*pixel_unaries.shape[1]
@@ -219,6 +245,80 @@ def segment_overlap_graph(pixel_unaries, segment_map, segment_unaries, pixel_reg
 	return gm
 
 
+def robust_pn_potts_model(pixel_unaries, segment_map, beta, gamma, gamma_max, k):
+	"""
+	Creates a potts model with higher order factors defined over segments.
+
+	This follows the robust Pn Potts model parameterization that is compatible with alpha-expansion
+	Russel(2012) - section 3.4.1
+
+	- pixel_unaries - a 3D array of shape (width, height, n_labels). 
+
+
+	beta is pixel smoothing parameter (same as potts model)
+	gamma is baseline inconsistency penalty
+	gamma_max is max inconsistency penalty
+	k is the increment in penalty with each inconsistent pixel
+
+	Must have gamma <= gamma_max and k >= 0
+
+	The label space is extended to include a new free label (l_f). The last label in the results must be disregarded.
+	If any of the resulting pixels take the free label there is something wrong...
+
+	Resulting model is compatible with alpha-expansion and alpha-beta-swap using graph cuts
+	"""
+	n_labels = pixel_unaries.shape[-1]
+	n_segments = np.max(segment_map) + 1
+
+	# add the free label to the unaries with extremely large cost
+	pixel_unaries = np.dstack((pixel_unaries, 
+		np.ones(pixel_unaries.shape[:2])))
+
+	# create a potts model over the new label space
+	pixel_regularizer=opengm.PottsFunction([n_labels+1,n_labels+1],0.0,beta)
+
+
+	# the segment unaries are defined in terms of the new label space. 
+	# Penalty of gamma for any label and gamma_max for free label
+	segment_unary = gamma * np.ones((1,n_labels + 1))
+	segment_unary[-1] = gamma_max
+	segment_unaries = np.tile(segment_unary,(n_segments, 1)) #this is not the most memory efficient way to do this.. hack for now
+
+	# inter-layer potentials are defined as 
+	# 0 if the labels are equal
+	# 0.5 k if either are free but not both
+	# k otherwise (both are free or both are non-free but non-equal)
+	def inter_layer(x,y):
+		if x == y:
+			return 0.
+		elif (x == n_labels or y == n_labels) and x != y:
+			return 0.5
+		else:
+			return 1.
+
+	inter_layer_potential = k*np.fromfunction(np.vectorize(inter_layer), shape=(n_labels+1, n_labels+1))
+
+
+	# the unary potentials must also be augmented to use this symmetric parameterization
+	# that is compatible with alpha-expansion. The pixel one actually doesn't need 
+	# to be done because of the infinite penalty already associated with the free label
+
+	# pixel_unary_augment = np.zeros((n_labels + 1))
+	# pixel_unary_augment[-1] = 0.5*k
+	# pixel_unaries += pixel_unary_augment
+
+	segment_unary_augment = np.zeros((n_labels + 1))
+	segment_unary_augment[-1] = -0.5*k
+	segment_unaries += segment_unary_augment
+
+	return segment_overlap_graph(pixel_unaries, segment_map, segment_unaries, 
+		pixel_regularizer=pixel_regularizer, 
+		segment_regularizer=None, 
+		inter_layer_regularizer=inter_layer_potential)
+
+
+
+
 
 ##########################################################################################
 ## Tests
@@ -251,12 +351,28 @@ if __name__ == '__main__':
 	opengm.visualizeGm(gm)
 	print "graph build in", t1-t0, "seconds"
 
+	# test inference is possible 
+	inference = opengm.inference.GraphCut(gm=gm)
+	t0 = time.time()
+	inference.infer()
+	t1 = time.time()
+
+	print "inference completed in", t1-t0, "seconds"
+
 
 	t0 = time.time()
 	gm  = segment_adjacency_graph(segment_values, segment_map, segment_regularizer=opengm.pottsFunction([n_segment_labels,n_segment_labels], 0.0, 0.5))	
 	t1 = time.time()
 	opengm.visualizeGm(gm)
 	print "graph build in", t1-t0, "seconds"
+
+	# test inference is possible 
+	inference = opengm.inference.GraphCut(gm=gm)
+	t0 = time.time()
+	inference.infer()
+	t1 = time.time()
+
+	print "inference completed in", t1-t0, "seconds"
 
 
 	t0 = time.time()
@@ -273,14 +389,41 @@ if __name__ == '__main__':
 	print "graph build in", t1-t0, "seconds"
 
 
-	# assert gm.numberOfVariables == n_pixels + np.max(segment_map)+1
-	# assert gm.numberOfLabels(0) == n_pixel_labels
-	# assert gm.numberOfLabels(n_pixels) == n_segment_labels
+	assert gm.numberOfVariables == n_pixels + np.max(segment_map)+1
+	assert gm.numberOfLabels(0) == n_pixel_labels
+	assert gm.numberOfLabels(n_pixels) == n_segment_labels
 
 	opengm.visualizeGm(gm)
 
 	# test inference is possible 
 	inference = opengm.inference.GraphCut(gm=gm)
+	t0 = time.time()
+	inference.infer()
+	t1 = time.time()
+
+	print "inference completed in", t1-t0, "seconds"
+
+
+	t0 = time.time()
+	gm = robust_pn_potts_model(
+		pixels, 
+		segment_map,
+		beta=0.1,
+		gamma=1.0,
+		gamma_max=2.0,
+		k=0.1)
+	t1 = time.time()
+
+	print "graph build in", t1-t0, "seconds"
+
+
+	assert gm.numberOfVariables == n_pixels + np.max(segment_map)+1
+	assert gm.numberOfLabels(0) == n_pixel_labels + 1 # the free label has been added
+
+	opengm.visualizeGm(gm)
+
+	# test inference is possible 
+	inference = opengm.inference.AlphaExpansion(gm=gm)
 	t0 = time.time()
 	inference.infer()
 	t1 = time.time()
